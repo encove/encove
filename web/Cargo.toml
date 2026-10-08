@@ -1,0 +1,26 @@
+[package]
+name = "encove-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ammonia = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+eyre = { workspace = true }
+jiff = { workspace = true }
+mail = { package = "encove-mail", path = "../mail" }
+percent-encoding = { workspace = true }
+serde = { workspace = true }
+store = { package = "encove-store", path = "../store" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+mail = { package = "encove-mail", path = "../mail", features = ["fixtures"] }
+similar-asserts = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true
