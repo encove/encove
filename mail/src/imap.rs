@@ -5,6 +5,7 @@
 //! anything on the server.
 
 use core::fmt::Write as _;
+use core::ops::RangeInclusive;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io;
@@ -161,6 +162,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ImapClient<S> {
         }
 
         let mut uid_validity = None;
+        let mut uid_next = None;
         let mut highest_modseq = None;
         for response in self.run(&command).await? {
             let Response::Data {
@@ -177,6 +179,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ImapClient<S> {
 
             match code {
                 ResponseCode::UidValidity(value) => uid_validity = Some(value),
+                ResponseCode::UidNext(value) => uid_next = Some(value),
                 ResponseCode::HighestModSeq(value) => highest_modseq = Some(value),
                 _ => {}
             }
@@ -191,15 +194,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ImapClient<S> {
 
         Ok(SelectedMailbox {
             uid_validity,
+            uid_next,
             highest_modseq,
         })
     }
 
     /// Returns the UIDs of messages in the selected mailbox that arrived on or after `date`
     pub(crate) async fn search_since(&mut self, date: Date) -> Result<BTreeSet<u32>, ImapError> {
-        let command = format!("UID SEARCH SINCE {}", date.strftime("%-d-%b-%Y"));
+        self.search(&format!("UID SEARCH SINCE {}", date.strftime("%-d-%b-%Y")))
+            .await
+    }
+
+    /// Returns the UIDs of all messages in the selected mailbox
+    pub(crate) async fn search_all(&mut self) -> Result<BTreeSet<u32>, ImapError> {
+        self.search("UID SEARCH ALL").await
+    }
+
+    /// Returns which of the given sorted UIDs are still in the selected mailbox
+    pub(crate) async fn search_uids(&mut self, uids: &[u32]) -> Result<BTreeSet<u32>, ImapError> {
+        if uids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        self.search(&format!("UID SEARCH UID {}", sequence_set(uids)))
+            .await
+    }
+
+    async fn search(&mut self, command: &str) -> Result<BTreeSet<u32>, ImapError> {
         let mut uids = BTreeSet::new();
-        for response in self.run(&command).await? {
+        for response in self.run(command).await? {
             let Response::MailboxData(MailboxDatum::Search(found)) = response else {
                 continue;
             };
@@ -214,49 +237,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ImapClient<S> {
         &mut self,
         uids: &[u32],
     ) -> Result<Vec<Fetched>, ImapError> {
-        self.uid_fetch(
-            uids,
-            "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-            None,
-        )
-        .await
+        self.uid_fetch(uids, "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+            .await
     }
 
     /// Fetches the full source and arrival time of the messages with the given sorted UIDs
     pub(crate) async fn fetch_sources(&mut self, uids: &[u32]) -> Result<Vec<Fetched>, ImapError> {
-        self.uid_fetch(uids, "(UID INTERNALDATE BODY.PEEK[])", None)
-            .await
+        self.uid_fetch(uids, "(UID INTERNALDATE BODY.PEEK[])").await
     }
 
     /// Fetches the flags of the messages with the given sorted UIDs
-    ///
-    /// With `changed_since`, only messages whose flags changed after that modification sequence
-    /// are returned, which requires CONDSTORE.
-    pub(crate) async fn fetch_flags(
-        &mut self,
-        uids: &[u32],
-        changed_since: Option<u64>,
-    ) -> Result<Vec<Fetched>, ImapError> {
-        self.uid_fetch(uids, "(UID FLAGS)", changed_since).await
+    pub(crate) async fn fetch_flags(&mut self, uids: &[u32]) -> Result<Vec<Fetched>, ImapError> {
+        self.uid_fetch(uids, "(UID FLAGS)").await
     }
 
-    async fn uid_fetch(
+    /// Fetches the flags of the messages in a range of UIDs that changed after `modseq`
+    ///
+    /// Only the messages that changed are returned, so the range can be large. This requires
+    /// CONDSTORE.
+    pub(crate) async fn fetch_changed_flags(
         &mut self,
-        uids: &[u32],
-        items: &str,
-        changed_since: Option<u64>,
+        uids: RangeInclusive<u32>,
+        modseq: u64,
     ) -> Result<Vec<Fetched>, ImapError> {
-        let mut fetched = Vec::new();
+        let mut set = String::new();
+        push_range(&mut set, *uids.start(), *uids.end());
+        self.fetch(&format!(
+            "UID FETCH {set} (UID FLAGS) (CHANGEDSINCE {modseq})"
+        ))
+        .await
+    }
+
+    async fn uid_fetch(&mut self, uids: &[u32], items: &str) -> Result<Vec<Fetched>, ImapError> {
         if uids.is_empty() {
-            return Ok(fetched);
+            return Ok(Vec::new());
         }
 
-        let mut command = format!("UID FETCH {} {items}", sequence_set(uids));
-        if let Some(modseq) = changed_since {
-            write!(command, " (CHANGEDSINCE {modseq})").unwrap();
-        }
+        self.fetch(&format!("UID FETCH {} {items}", sequence_set(uids)))
+            .await
+    }
 
-        for response in self.run(&command).await? {
+    async fn fetch(&mut self, command: &str) -> Result<Vec<Fetched>, ImapError> {
+        let mut fetched = Vec::new();
+        for response in self.run(command).await? {
             let Response::Fetch(_, attributes) = response else {
                 continue;
             };
@@ -590,6 +613,8 @@ impl MailboxName {
 pub(crate) struct SelectedMailbox {
     /// Changes when UIDs in the mailbox are no longer valid
     pub uid_validity: u32,
+    /// The UID that the next message added to the mailbox will at least have
+    pub uid_next: Option<u32>,
     /// The highest modification sequence of any message, if the server supports CONDSTORE
     pub highest_modseq: Option<u64>,
 }

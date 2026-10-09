@@ -3,7 +3,10 @@
 //! Like synchronized messages, imported messages are only stored once: a message is skipped if a
 //! message with the same `Message-ID` header is already stored. A message without a `Message-ID`
 //! gets one derived from a hash of its source, so that importing it again doesn't store it twice.
-//! Imported messages are marked as read, and are not added to any mailbox.
+//! Imported messages are marked as read, and are not added to any mailbox: [`Sync::link()`] adds them
+//! to the mailboxes that contain them on the server.
+//!
+//! [`Sync::link()`]: crate::Sync::link
 
 use core::fmt::{self, Write as _};
 use core::str;

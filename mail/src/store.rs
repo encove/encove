@@ -41,6 +41,12 @@ pub struct Mailbox {
     pub uid_validity: u32,
     /// The highest modification sequence seen, if the server supports CONDSTORE
     pub highest_modseq: Option<u64>,
+    /// The lowest UID in the window at the last synchronization, or the next UID if the window was
+    /// empty, if the mailbox has been synchronized
+    ///
+    /// Synchronization only looks at entries from here on: lower UIDs belong to messages that
+    /// arrived before the window, which keep their entries.
+    pub window_start: Option<u32>,
     /// What the mailbox is used for, if it has a special use
     pub special_use: Option<SpecialUse>,
     /// The character separating levels of the hierarchy, if there is one
@@ -95,6 +101,7 @@ impl Encode for Mailbox {
             name,
             uid_validity,
             highest_modseq,
+            window_start,
             special_use,
             delimiter,
         } = self;
@@ -102,6 +109,7 @@ impl Encode for Mailbox {
         name.encode(buf);
         uid_validity.encode(buf);
         highest_modseq.encode(buf);
+        window_start.encode(buf);
         SpecialUse::to_bits(*special_use).encode(buf);
         delimiter.encode(buf);
     }
@@ -113,6 +121,7 @@ impl Decode for Mailbox {
             name: MailboxName::decode(buf),
             uid_validity: u32::decode(buf),
             highest_modseq: Option::decode(buf),
+            window_start: Option::decode(buf),
             special_use: SpecialUse::from_bits(u8::decode(buf)),
             delimiter: Option::decode(buf),
         }
@@ -194,6 +203,51 @@ impl Decode for Entry {
             message: MessageKey::decode(buf),
         }
     }
+}
+
+/// A message's presence in a mailbox, indexed by the message
+///
+/// This has no value: the key holds the message key, mailbox name and UID of an [`Entry`].
+#[derive(Debug)]
+pub struct MessageEntry;
+
+impl Value for MessageEntry {
+    type SelfType<'a>
+        = ()
+    where
+        Self: 'a;
+    type AsBytes<'a>
+        = [u8; 0]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(0)
+    }
+
+    fn from_bytes<'a>(_: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+    }
+
+    fn as_bytes<'a, 'b: 'a>(_: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b,
+    {
+        []
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new("encove::mail::message::entry")
+    }
+}
+
+/// Entries, by message key, mailbox name and UID
+impl Table for MessageEntry {
+    type Key = (MessageKey, &'static str, u32);
+    const DEFINITION: TableDefinition<'static, (MessageKey, &'static str, u32), Self> =
+        TableDefinition::new("encove::mail::message::entry");
 }
 
 /// The parts of a message needed to list it and show its headers, extracted when it is stored

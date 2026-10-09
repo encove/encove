@@ -206,13 +206,12 @@ impl<T: Table> WriteTable<'_, T> {
         Ok(())
     }
 
-    /// Removes the row for a key, if there is one
+    /// Removes the row for a key, returning its value if there was one
     pub fn remove<'k>(
         &mut self,
         key: impl Borrow<<<T as Table>::Key as Value>::SelfType<'k>>,
-    ) -> Result<(), StoreError> {
-        self.0.remove(key)?;
-        Ok(())
+    ) -> Result<Option<AccessGuard<'_, T>>, StoreError> {
+        Ok(self.0.remove(key)?)
     }
 
     /// Removes all rows for which `keep` returns `false`

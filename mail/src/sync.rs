@@ -2,19 +2,27 @@
 //!
 //! For each mailbox, the messages that arrived in the last few days are found with
 //! `UID SEARCH SINCE`. New messages are first matched to stored ones by their `Message-ID` header,
-//! so that a message in several mailboxes is only downloaded once. The flags of known messages are
-//! refreshed, using CONDSTORE (RFC 7162) to only fetch changes if the server supports it. Messages
-//! that left the window or the server are removed, unless they are older than every message that is
-//! still in a mailbox, like messages imported from an archive.
+//! so that a message in several mailboxes is only downloaded once. The flags of stored messages
+//! are refreshed, using CONDSTORE (RFC 7162) to only fetch changes if the server supports it.
+//!
+//! The state of each mailbox records where the window started at the last synchronization. The
+//! entries from there on that are no longer in the window are checked with `UID SEARCH UID`: the
+//! ones the server still has aged out of the window and are kept, like all entries of messages
+//! that arrived before it, while the others are removed. A message is removed when it loses its
+//! last entry, so messages that never had one, like messages imported from an archive that aren't
+//! on the server, are kept. This keeps the work proportional to the window and the changes, rather
+//! than to the number of stored messages.
+//!
+//! [`Sync::link()`] looks at all messages instead, to add the entries for stored messages, like
+//! messages imported from an archive, without downloading any messages.
 
 use core::time::Duration;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use jiff::civil::Date;
-use jiff::{ToSpan, Zoned};
 use mail_parser::MessageParser;
-use store::{Store, WriteTable};
+use store::{Store, StoreError, WriteTable};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -23,13 +31,16 @@ use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
 use crate::imap::{self, Account, Fetched, Flags, ImapClient, ListedMailbox, MailboxName};
-use crate::store::{Entry, Mailbox, MessageContents, MessageData, MessageKey, MessageSource};
+use crate::store::{
+    Entry, Mailbox, MessageContents, MessageData, MessageEntry, MessageKey, MessageSource,
+};
 
 pub struct Sync<'a, S: AsyncRead + AsyncWrite + Unpin> {
     client: ImapClient<S>,
     store: &'a Store,
-    since: Date,
     observed: ObservedFlags,
+    /// The messages that lost an entry, which are removed if no other entry refers to them
+    unlinked: HashSet<MessageKey>,
 }
 
 impl<'a> Sync<'a, TlsStream<TcpStream>> {
@@ -37,7 +48,6 @@ impl<'a> Sync<'a, TlsStream<TcpStream>> {
     pub async fn connect(
         account: &'a Account,
         store: &'a Store,
-        days: i64,
     ) -> Result<Sync<'a, TlsStream<TcpStream>>, Error> {
         let mut client = ImapClient::connect(account).await?;
         client.authenticate(account).await?;
@@ -45,18 +55,40 @@ impl<'a> Sync<'a, TlsStream<TcpStream>> {
         Ok(Self {
             client,
             store,
-            since: Zoned::now().date().saturating_sub(days.days()),
             observed: HashMap::new(),
+            unlinked: HashSet::new(),
         })
     }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
-    pub async fn sync(&mut self) -> Result<Report, Error> {
+    /// Synchronizes the messages that arrived on or after `since`
+    ///
+    /// Messages that aren't stored yet are downloaded, and messages that left their last mailbox
+    /// are removed.
+    pub async fn sync(&mut self, since: Date) -> Result<Report, Error> {
+        let (mut report, listed) = self.sync_mailboxes(Scope::Since(since)).await?;
+        report.removed = block_in_place(|| self.remove_stale(&listed))?;
+        Ok(report)
+    }
+
+    /// Links stored messages to all mailboxes containing them, and updates their flags
+    ///
+    /// Unlike [`Sync::sync()`], this looks at all messages, but it only fetches the `Message-ID`
+    /// header and flags of messages that don't have an entry yet. Messages that aren't stored are
+    /// not downloaded, and no messages are removed.
+    pub async fn link(&mut self) -> Result<Report, Error> {
+        let (report, _) = self.sync_mailboxes(Scope::All).await?;
+        Ok(report)
+    }
+
+    /// Synchronizes each selectable mailbox, returning the report and the names of the mailboxes
+    async fn sync_mailboxes(&mut self, scope: Scope) -> Result<(Report, Vec<MailboxName>), Error> {
         block_in_place(|| {
             let writer = self.store.writer()?;
             writer.table::<Mailbox>()?;
             writer.table::<Entry>()?;
+            writer.table::<MessageEntry>()?;
             writer.table::<MessageKey>()?;
             writer.table::<MessageData>()?;
             writer.table::<MessageContents>()?;
@@ -72,7 +104,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
             }
 
             listed.push(mailbox.name.clone());
-            match self.sync_mailbox(&mailbox).await {
+            match self.sync_mailbox(&mailbox, scope).await {
                 Ok(changes) => {
                     tracing::info!(mailbox = %mailbox.name.decoded(), %changes, "synchronized");
                     report.add(changes);
@@ -86,11 +118,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
             }
         }
 
-        report.removed = block_in_place(|| self.remove_stale(&listed))?;
-        Ok(report)
+        Ok((report, listed))
     }
 
-    async fn sync_mailbox(&mut self, mailbox: &ListedMailbox) -> Result<Report, Error> {
+    async fn sync_mailbox(
+        &mut self,
+        mailbox: &ListedMailbox,
+        scope: Scope,
+    ) -> Result<Report, Error> {
         let ListedMailbox {
             name,
             delimiter,
@@ -99,23 +134,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
         } = mailbox;
 
         let selected = self.client.examine(name).await?;
-        let (previous_modseq, known) =
-            block_in_place(|| self.known_entries(name, selected.uid_validity))?;
+        let window = match scope {
+            Scope::Since(since) => self.client.search_since(since).await?,
+            Scope::All => self.client.search_all().await?,
+        };
 
-        let window = self.client.search_since(self.since).await?;
+        let Known {
+            mailbox: previous,
+            entries: known,
+            highest,
+        } = block_in_place(|| self.known_entries(name, selected.uid_validity, scope, &window))?;
+
         let mut report = Report {
             mailboxes: 1,
             ..Report::default()
         };
 
-        let mut departed = Vec::new();
         let mut retained = Vec::new();
+        let mut outside = Vec::new();
         for uid in known.keys() {
             match window.contains(uid) {
                 true => retained.push(*uid),
-                false => departed.push(*uid),
+                false => outside.push(*uid),
             }
         }
+
+        let departed = match scope {
+            Scope::Since(_) => {
+                let present = self.client.search_uids(&outside).await?;
+                let mut departed = Vec::new();
+                for uid in outside {
+                    if !present.contains(&uid) {
+                        departed.push(uid);
+                    }
+                }
+                departed
+            }
+            Scope::All => outside,
+        };
 
         let mut added = Vec::new();
         for uid in &window {
@@ -135,15 +191,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
             report.linked += block_in_place(|| self.link_messages(name, fetched, &mut downloads))?;
         }
 
-        let mut uids = Vec::new();
-        for uid in downloads.keys() {
-            uids.push(*uid);
+        match scope {
+            Scope::Since(_) => {
+                let mut uids = Vec::new();
+                for uid in downloads.keys() {
+                    uids.push(*uid);
+                }
+
+                for chunk in uids.chunks(SOURCE_BATCH) {
+                    let fetched = self.client.fetch_sources(chunk).await?;
+                    report.downloaded +=
+                        block_in_place(|| self.store_sources(fetched, &downloads, name))?;
+                }
+            }
+            Scope::All => {}
         }
 
-        for chunk in uids.chunks(SOURCE_BATCH) {
-            let fetched = self.client.fetch_sources(chunk).await?;
-            report.downloaded += block_in_place(|| self.store_sources(fetched, &downloads, name))?;
-        }
+        let (previous_modseq, previous_start) = match previous {
+            Some(Mailbox {
+                name: _,
+                uid_validity: _,
+                highest_modseq,
+                window_start,
+                special_use: _,
+                delimiter: _,
+            }) => (highest_modseq, window_start),
+            None => (None, None),
+        };
 
         let refresh = match (previous_modseq, selected.highest_modseq) {
             (Some(previous), Some(current)) if previous == current => FlagRefresh::Unchanged,
@@ -154,16 +228,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
         report.updated = match refresh {
             FlagRefresh::Unchanged => 0,
             FlagRefresh::ChangedSince(modseq) => {
-                self.refresh_flags(name, &known, &retained, Some(modseq))
-                    .await?
+                self.refresh_changed_flags(name, highest, modseq).await?
             }
-            FlagRefresh::All => self.refresh_flags(name, &known, &retained, None).await?,
+            FlagRefresh::All => self.refresh_flags(name, &retained).await?,
+        };
+
+        let window_start = match (scope, window.first()) {
+            (Scope::Since(_), Some(first)) => Some(*first),
+            (Scope::Since(_), None) => selected.uid_next.or(previous_start),
+            (Scope::All, _) => previous_start,
         };
 
         let stored = Mailbox {
             name: name.clone(),
             uid_validity: selected.uid_validity,
             highest_modseq: selected.highest_modseq,
+            window_start,
             special_use: *special_use,
             delimiter: delimiter.clone(),
         };
@@ -172,7 +252,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
         Ok(report)
     }
 
-    fn save_mailbox(&self, mailbox: &Mailbox) -> Result<(), store::StoreError> {
+    fn save_mailbox(&self, mailbox: &Mailbox) -> Result<(), StoreError> {
         let writer = self.store.writer()?;
         writer
             .table::<Mailbox>()?
@@ -180,72 +260,134 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
         writer.commit()
     }
 
-    /// Returns the stored modification sequence and entries of a mailbox
+    /// Returns the stored state of a mailbox, and the entries that synchronizing it looks at
     ///
-    /// If the mailbox has a new UIDVALIDITY, its stored entries are removed instead.
+    /// When synchronizing recent messages, these are the entries from the start of the previous
+    /// window or the current window, whichever is lower. Entries with lower UIDs belong to
+    /// messages that arrived before both windows, which are left alone.
+    ///
+    /// If the mailbox has a new UIDVALIDITY, its entries are removed and its state is ignored. The
+    /// messages they referred to are kept even if no other entry refers to them, since they may
+    /// still be in the mailbox with a new UID, which [`Sync::link()`] finds.
     fn known_entries(
         &self,
         mailbox: &MailboxName,
         uid_validity: u32,
-    ) -> Result<(Option<u64>, Entries), store::StoreError> {
+        scope: Scope,
+        window: &BTreeSet<u32>,
+    ) -> Result<Known, StoreError> {
         let writer = self.store.writer()?;
         let stored = writer
             .table::<Mailbox>()?
             .get(mailbox.as_str())?
             .map(|stored| stored.value());
 
-        let mut entries = writer.table::<Entry>()?;
         let name = mailbox.as_str();
-        let known = match stored {
-            Some(stored) if stored.uid_validity == uid_validity => {
-                let mut known = BTreeMap::new();
-                for row in entries.range((name, 0)..=(name, u32::MAX))? {
-                    let (_, entry) = row?;
-                    let Entry {
-                        mailbox: _,
-                        uid,
-                        message,
-                    } = entry.value();
-                    known.insert(uid, message);
-                }
-                (stored.highest_modseq, known)
-            }
+        let mut entries = writer.table::<Entry>()?;
+        let previous = match stored {
+            Some(stored) if stored.uid_validity == uid_validity => Some(stored),
             Some(_) | None => {
-                entries.retain_in((name, 0)..=(name, u32::MAX), |_, _| false)?;
-                (None, BTreeMap::new())
+                let mut index = writer.table::<MessageEntry>()?;
+                remove_mailbox_entries(&mut entries, &mut index, name)?;
+                None
             }
+        };
+
+        let start = match scope {
+            Scope::Since(_) => {
+                let previous_start = previous.as_ref().and_then(|mailbox| mailbox.window_start);
+                match (previous_start, window.first()) {
+                    (Some(previous), Some(first)) => Some(previous.min(*first)),
+                    (Some(previous), None) => Some(previous),
+                    (None, Some(first)) => Some(*first),
+                    (None, None) => None,
+                }
+            }
+            Scope::All => Some(0),
+        };
+
+        let mut known = BTreeMap::new();
+        if let Some(start) = start {
+            for row in entries.range((name, start)..=(name, u32::MAX))? {
+                let (_, entry) = row?;
+                let Entry {
+                    mailbox: _,
+                    uid,
+                    message,
+                } = entry.value();
+                known.insert(uid, message);
+            }
+        }
+
+        let highest = match entries.range((name, 0)..=(name, u32::MAX))?.next_back() {
+            Some(row) => {
+                let (key, _) = row?;
+                let (_, uid) = key.value();
+                Some(uid)
+            }
+            None => None,
         };
 
         drop(entries);
         writer.commit()?;
-        Ok(known)
+        Ok(Known {
+            mailbox: previous,
+            entries: known,
+            highest,
+        })
     }
 
-    /// Updates the stored flags of known messages, returning the number of messages that changed
-    async fn refresh_flags(
+    /// Updates the stored flags of messages that changed after `modseq`, returning the number of
+    /// messages that changed
+    ///
+    /// The flags are fetched for all UIDs up to the highest UID with an entry, including messages
+    /// outside the window, but the server only returns the messages that changed.
+    async fn refresh_changed_flags(
         &mut self,
         mailbox: &MailboxName,
-        known: &Entries,
-        uids: &[u32],
-        changed_since: Option<u64>,
+        highest: Option<u32>,
+        modseq: u64,
     ) -> Result<usize, Error> {
+        let Some(highest) = highest else {
+            return Ok(0);
+        };
+
+        let fetched = self.client.fetch_changed_flags(1..=highest, modseq).await?;
+        Ok(block_in_place(|| self.update_flags(mailbox, fetched))?)
+    }
+
+    /// Updates the stored flags of the messages with the given UIDs, returning the number of
+    /// messages that changed
+    async fn refresh_flags(&mut self, mailbox: &MailboxName, uids: &[u32]) -> Result<usize, Error> {
         let mut updated = 0;
         for chunk in uids.chunks(FLAG_BATCH) {
-            let fetched = self.client.fetch_flags(chunk, changed_since).await?;
-            updated += block_in_place(|| self.update_flags(mailbox, fetched, known))?;
+            let fetched = self.client.fetch_flags(chunk).await?;
+            updated += block_in_place(|| self.update_flags(mailbox, fetched))?;
         }
 
         Ok(updated)
     }
 
-    fn remove_entries(&self, mailbox: &MailboxName, uids: &[u32]) -> Result<(), store::StoreError> {
+    /// Removes the entries for UIDs that are no longer in a mailbox
+    fn remove_entries(&mut self, mailbox: &MailboxName, uids: &[u32]) -> Result<(), StoreError> {
         let writer = self.store.writer()?;
         let mut entries = writer.table::<Entry>()?;
+        let mut index = writer.table::<MessageEntry>()?;
         for uid in uids {
-            entries.remove((mailbox.as_str(), *uid))?;
+            let Some(entry) = entries.remove((mailbox.as_str(), *uid))? else {
+                continue;
+            };
+
+            let Entry {
+                mailbox: _,
+                uid: _,
+                message,
+            } = entry.value();
+            index.remove((message, mailbox.as_str(), *uid))?;
+            self.unlinked.insert(message);
         }
 
-        drop(entries);
+        drop((entries, index));
         writer.commit()
     }
 
@@ -257,11 +399,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
         mailbox: &MailboxName,
         fetched: Vec<Fetched>,
         downloads: &mut BTreeMap<u32, Flags>,
-    ) -> Result<usize, store::StoreError> {
+    ) -> Result<usize, StoreError> {
         let writer = self.store.writer()?;
         let message_ids = writer.table::<MessageKey>()?;
         let mut metadata = writer.table::<MessageData>()?;
         let mut entries = writer.table::<Entry>()?;
+        let mut index = writer.table::<MessageEntry>()?;
         let mut linked = 0;
 
         let parser = MessageParser::default();
@@ -287,7 +430,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
             match key {
                 Some(key) => {
                     observe_flags(&mut self.observed, &mut metadata, key, flags, mailbox)?;
-                    insert_entry(&mut entries, mailbox, uid, key)?;
+                    insert_entry(&mut entries, &mut index, mailbox, uid, key)?;
                     linked += 1;
                 }
                 None => {
@@ -296,7 +439,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
             }
         }
 
-        drop((message_ids, metadata, entries));
+        drop((message_ids, metadata, entries, index));
         writer.commit()?;
         Ok(linked)
     }
@@ -310,7 +453,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
         fetched: Vec<Fetched>,
         downloads: &BTreeMap<u32, Flags>,
         mailbox: &MailboxName,
-    ) -> Result<usize, store::StoreError> {
+    ) -> Result<usize, StoreError> {
         let mut messages = Vec::new();
         for Fetched {
             uid,
@@ -333,6 +476,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
         let mut contents = writer.table::<MessageContents>()?;
         let mut sources = writer.table::<MessageSource>()?;
         let mut entries = writer.table::<Entry>()?;
+        let mut index = writer.table::<MessageEntry>()?;
         for (uid, message, content, source) in &messages {
             let stored = match &message.message_id {
                 Some(message_id) => message_ids.get(message_id.as_str())?.map(|key| key.value()),
@@ -368,22 +512,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
                 }
             };
 
-            insert_entry(&mut entries, mailbox, *uid, key)?;
+            insert_entry(&mut entries, &mut index, mailbox, *uid, key)?;
         }
 
-        drop((message_ids, metadata, contents, sources, entries));
+        drop((message_ids, metadata, contents, sources, entries, index));
         writer.commit()?;
         Ok(messages.len())
     }
 
-    /// Stores the flags of fetched messages, returning how many messages changed
+    /// Stores the flags of fetched messages that have an entry, returning how many messages
+    /// changed
     fn update_flags(
         &mut self,
         mailbox: &MailboxName,
         fetched: Vec<Fetched>,
-        known: &Entries,
-    ) -> Result<usize, store::StoreError> {
-        let mut observed = Vec::new();
+    ) -> Result<usize, StoreError> {
+        if fetched.is_empty() {
+            return Ok(0);
+        }
+
+        let writer = self.store.writer()?;
+        let entries = writer.table::<Entry>()?;
+        let mut metadata = writer.table::<MessageData>()?;
+        let mut updated = 0;
         for Fetched {
             uid,
             flags,
@@ -391,95 +542,93 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Sync<'_, S> {
             body: _,
         } in fetched
         {
-            let (Some(flags), Some(key)) = (flags, known.get(&uid)) else {
+            let Some(flags) = flags else {
                 continue;
             };
-            observed.push((*key, flags));
-        }
 
-        if observed.is_empty() {
-            return Ok(0);
-        }
+            let Some(entry) = entries.get((mailbox.as_str(), uid))? else {
+                continue;
+            };
 
-        let writer = self.store.writer()?;
-        let mut metadata = writer.table::<MessageData>()?;
-        let mut updated = 0;
-        for (key, flags) in observed {
-            if observe_flags(&mut self.observed, &mut metadata, key, flags, mailbox)? {
-                updated += 1;
-            }
-        }
-
-        drop(metadata);
-        writer.commit()?;
-        Ok(updated)
-    }
-
-    /// Removes mailboxes that are no longer listed and messages that are no longer in any mailbox
-    ///
-    /// Only messages received after the oldest message that is still in a mailbox are removed.
-    /// Returns the number of messages removed.
-    fn remove_stale(&self, listed: &[MailboxName]) -> Result<usize, store::StoreError> {
-        let writer = self.store.writer()?;
-        writer
-            .table::<Mailbox>()?
-            .retain(|name, _| is_listed(listed, name))?;
-
-        let mut entries = writer.table::<Entry>()?;
-        entries.retain(|(name, _), _| is_listed(listed, name))?;
-
-        let mut referenced = HashSet::new();
-        for row in entries.iter()? {
-            let (_, entry) = row?;
             let Entry {
                 mailbox: _,
                 uid: _,
                 message,
             } = entry.value();
-            referenced.insert(message);
+            if observe_flags(&mut self.observed, &mut metadata, message, flags, mailbox)? {
+                updated += 1;
+            }
+        }
+
+        drop((entries, metadata));
+        writer.commit()?;
+        Ok(updated)
+    }
+
+    /// Removes mailboxes that are no longer listed, and messages that left their last mailbox
+    ///
+    /// Only messages that lost an entry are removed, so messages that never had one, like messages
+    /// imported from an archive that aren't on the server, are kept. Returns the number of
+    /// messages removed.
+    fn remove_stale(&mut self, listed: &[MailboxName]) -> Result<usize, StoreError> {
+        let writer = self.store.writer()?;
+        let mut mailboxes = writer.table::<Mailbox>()?;
+        let mut unlisted = Vec::new();
+        for row in mailboxes.iter()? {
+            let (name, _) = row?;
+            let name = name.value();
+            if !is_listed(listed, name) {
+                unlisted.push(name.to_owned());
+            }
+        }
+
+        let mut entries = writer.table::<Entry>()?;
+        let mut index = writer.table::<MessageEntry>()?;
+        for name in &unlisted {
+            mailboxes.remove(name.as_str())?;
+            for message in remove_mailbox_entries(&mut entries, &mut index, name)? {
+                self.unlinked.insert(message);
+            }
         }
 
         let mut metadata = writer.table::<MessageData>()?;
-        let mut oldest = None;
-        for key in &referenced {
-            let Some(data) = metadata.get(*key)? else {
-                continue;
-            };
-
-            let MessageData { received, .. } = data.value();
-            if oldest.is_none_or(|oldest| received < oldest) {
-                oldest = Some(received);
-            }
-        }
-
-        let mut removed = Vec::new();
-        metadata.retain(|key, data| {
-            let MessageData {
-                received,
-                message_id,
-                ..
-            } = data;
-            let keep = referenced.contains(&key) || oldest.is_none_or(|oldest| received <= oldest);
-            if !keep {
-                removed.push((key, message_id));
-            }
-            keep
-        })?;
-
         let mut contents = writer.table::<MessageContents>()?;
         let mut sources = writer.table::<MessageSource>()?;
         let mut message_ids = writer.table::<MessageKey>()?;
-        for (key, message_id) in &removed {
-            contents.remove(*key)?;
-            sources.remove(*key)?;
+        let mut removed = 0;
+        for message in self.unlinked.drain() {
+            if let Some(row) = index
+                .range((message, "", 0)..(message.next(), "", 0))?
+                .next()
+            {
+                row?;
+                continue;
+            }
+
+            let Some(data) = metadata.remove(message)? else {
+                continue;
+            };
+
+            let MessageData { message_id, .. } = data.value();
+            contents.remove(message)?;
+            sources.remove(message)?;
             if let Some(message_id) = message_id {
                 message_ids.remove(message_id.as_str())?;
             }
+            removed += 1;
         }
 
-        drop((entries, metadata, contents, sources, message_ids));
+        drop((
+            mailboxes,
+            entries,
+            index,
+            metadata,
+            contents,
+            sources,
+            message_ids,
+        ));
         writer.commit()?;
-        Ok(removed.len())
+        Ok(removed)
     }
 }
 
@@ -513,7 +662,7 @@ fn observe_flags(
     key: MessageKey,
     flags: Flags,
     mailbox: &MailboxName,
-) -> Result<bool, store::StoreError> {
+) -> Result<bool, StoreError> {
     if let Some((previous, other)) = observed.insert(key, (flags, mailbox.clone()))
         && previous != flags
     {
@@ -543,17 +692,48 @@ fn observe_flags(
 /// Records that a mailbox contains a message at the given UID
 fn insert_entry(
     entries: &mut WriteTable<'_, Entry>,
+    index: &mut WriteTable<'_, MessageEntry>,
     mailbox: &MailboxName,
     uid: u32,
     message: MessageKey,
-) -> Result<(), store::StoreError> {
+) -> Result<(), StoreError> {
     let entry = Entry {
         mailbox: mailbox.clone(),
         uid,
         message,
     };
 
-    entries.insert((mailbox.as_str(), uid), &entry)
+    entries.insert((mailbox.as_str(), uid), &entry)?;
+    index.insert((message, mailbox.as_str(), uid), ())
+}
+
+/// Removes all entries of a mailbox, returning the keys of the messages they referred to
+fn remove_mailbox_entries(
+    entries: &mut WriteTable<'_, Entry>,
+    index: &mut WriteTable<'_, MessageEntry>,
+    mailbox: &str,
+) -> Result<Vec<MessageKey>, StoreError> {
+    let mut removed = Vec::new();
+    entries.retain_in(
+        (mailbox, 0)..=(mailbox, u32::MAX),
+        |_,
+         Entry {
+             mailbox: _,
+             uid,
+             message,
+         }| {
+            removed.push((uid, message));
+            false
+        },
+    )?;
+
+    let mut messages = Vec::new();
+    for (uid, message) in removed {
+        index.remove((message, mailbox, uid))?;
+        messages.push(message);
+    }
+
+    Ok(messages)
 }
 
 fn is_listed(listed: &[MailboxName], name: &str) -> bool {
@@ -569,8 +749,27 @@ fn is_listed(listed: &[MailboxName], name: &str) -> bool {
 /// The message key of each UID in a mailbox
 type Entries = BTreeMap<u32, MessageKey>;
 
+/// The stored state of a mailbox at the start of its synchronization
+struct Known {
+    /// The state of the mailbox, unless it is new or has a new UIDVALIDITY
+    mailbox: Option<Mailbox>,
+    /// The entries that the synchronization looks at
+    entries: Entries,
+    /// The highest UID with an entry
+    highest: Option<u32>,
+}
+
 /// The flags seen for each message during a synchronization, and the mailbox they were seen in
 type ObservedFlags = HashMap<MessageKey, (Flags, MailboxName)>;
+
+/// Which messages of each mailbox to synchronize
+#[derive(Clone, Copy)]
+enum Scope {
+    /// Messages that arrived on or after the date, which are downloaded if they aren't stored
+    Since(Date),
+    /// All messages, which are only linked if they are stored
+    All,
+}
 
 /// How to bring the stored flags of known messages up to date
 enum FlagRefresh {
@@ -646,7 +845,7 @@ pub enum Error {
     Imap(#[from] imap::ImapError),
     /// The store could not be read or written
     #[error(transparent)]
-    Store(#[from] store::StoreError),
+    Store(#[from] StoreError),
 }
 
 const HEADER_BATCH: usize = 500;
@@ -667,6 +866,7 @@ mod tests {
     use crate::{
         Address, Body,
         fixtures::{LUNCH, PLANS, REPLY},
+        import_mbox,
     };
 
     use super::*;
@@ -686,7 +886,7 @@ mod tests {
         let sent = FakeMailbox::new("[Gmail]/Sent Mail", "\\Sent \\HasNoChildren", 21)
             .message(21, "\\Seen", 21, REPLY);
 
-        let (report, commands) = run(&store, vec![inbox, all, sent.clone()]).await;
+        let (report, commands) = run(&store, vec![inbox, all, sent.clone()], Operation::Sync).await;
         assert_eq!(
             (report.mailboxes, report.downloaded, report.linked),
             (3, 3, 3)
@@ -703,13 +903,14 @@ mod tests {
             .message(12, "\\Seen", 14, LUNCH)
             .message(13, "\\Seen", 13, REPLY);
 
-        let (report, commands) = run(&store, vec![inbox, all, sent]).await;
+        let (report, commands) = run(&store, vec![inbox, all, sent], Operation::Sync).await;
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.updated, 1);
         assert_eq!(report.departed, 1);
         assert_eq!(report.removed, 0);
-        assert!(commands.contains(&"UID FETCH 2 (UID FLAGS) (CHANGEDSINCE 7)".to_owned()));
-        assert!(commands.contains(&"UID FETCH 11:13 (UID FLAGS) (CHANGEDSINCE 13)".to_owned()));
+        assert!(commands.contains(&"UID SEARCH UID 1".to_owned()));
+        assert!(commands.contains(&"UID FETCH 1:2 (UID FLAGS) (CHANGEDSINCE 7)".to_owned()));
+        assert!(commands.contains(&"UID FETCH 1:13 (UID FLAGS) (CHANGEDSINCE 13)".to_owned()));
         assert!(!commands.contains(&"UID FETCH 21 (UID FLAGS) (CHANGEDSINCE 21)".to_owned()));
 
         let reader = store.reader().unwrap();
@@ -742,9 +943,9 @@ mod tests {
 
         let all = FakeMailbox::new("[Gmail]/All Mail", "\\All \\HasNoChildren", 15)
             .message(12, "\\Seen", 14, LUNCH);
-        let (report, _) = run(&store, vec![all]).await;
+        let (report, _) = run(&store, vec![all], Operation::Sync).await;
         assert_eq!(report.departed, 2);
-        assert_eq!(report.removed, 1);
+        assert_eq!(report.removed, 2);
 
         let reader = store.reader().unwrap();
         let mut subjects = Vec::new();
@@ -753,7 +954,97 @@ mod tests {
             let MessageData { subject, .. } = data.value();
             subjects.push(subject);
         }
-        assert_eq!(subjects, ["Plans for Thursday", "Lunch"]);
+        assert_eq!(subjects, ["Lunch"]);
+        drop(reader);
+
+        let all = FakeMailbox::new("[Gmail]/All Mail", "\\All \\HasNoChildren", 16);
+        let (report, commands) = run(&store, vec![all], Operation::Sync).await;
+        assert_eq!((report.departed, report.removed), (1, 1));
+        assert!(commands.contains(&"UID SEARCH UID 12".to_owned()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn links_imported_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("encove.redb"));
+
+        let mut mbox = String::new();
+        for source in [PLANS, REPLY] {
+            mbox.push_str("From 1@xxx Thu Oct 09 10:00:00 +0000 2025\n");
+            mbox.push_str(source);
+            mbox.push('\n');
+        }
+        import_mbox(&store, mbox.as_bytes()).unwrap();
+
+        let inbox = FakeMailbox::new("INBOX", "\\HasNoChildren", 7).archived(1, "", 5, PLANS);
+        let all = FakeMailbox::new("[Gmail]/All Mail", "\\All \\HasNoChildren", 13)
+            .archived(11, "", 11, PLANS)
+            .message(12, "", 12, LUNCH)
+            .archived(13, "\\Seen", 13, REPLY);
+        let sent = FakeMailbox::new("[Gmail]/Sent Mail", "\\Sent \\HasNoChildren", 21)
+            .archived(21, "\\Seen", 21, REPLY);
+
+        let (report, commands) = run(
+            &store,
+            vec![inbox.clone(), all, sent.clone()],
+            Operation::Link,
+        )
+        .await;
+        assert_eq!(
+            (report.mailboxes, report.linked, report.downloaded),
+            (3, 4, 0)
+        );
+        assert!(commands.contains(&"UID SEARCH ALL".to_owned()));
+        for command in &commands {
+            assert!(!command.contains("BODY.PEEK[]"), "{command}");
+        }
+
+        let all = FakeMailbox::new("[Gmail]/All Mail", "\\All \\HasNoChildren", 14)
+            .archived(11, "\\Seen", 14, PLANS)
+            .message(12, "", 12, LUNCH)
+            .archived(13, "\\Seen", 13, REPLY);
+        let (report, commands) = run(&store, vec![inbox, all, sent], Operation::Sync).await;
+        assert_eq!(
+            (
+                report.departed,
+                report.downloaded,
+                report.updated,
+                report.removed
+            ),
+            (0, 1, 1, 0)
+        );
+        assert!(commands.contains(&"UID SEARCH UID 13".to_owned()));
+        assert!(commands.contains(&"UID FETCH 1:13 (UID FLAGS) (CHANGEDSINCE 13)".to_owned()));
+
+        let reader = store.reader().unwrap();
+        let metadata = reader.table::<MessageData>().unwrap();
+        let mut stored = Vec::new();
+        for row in reader.table::<Entry>().unwrap().iter().unwrap() {
+            let (_, entry) = row.unwrap();
+            let Entry {
+                mailbox,
+                uid,
+                message,
+            } = entry.value();
+            let MessageData { subject, flags, .. } =
+                metadata.get(message).unwrap().unwrap().value();
+            let read = match flags.contains(Flags::SEEN) {
+                true => "read",
+                false => "unread",
+            };
+            stored.push(format!("{} {uid}: {subject} ({read})", mailbox.as_str()));
+        }
+
+        assert_eq!(
+            stored,
+            [
+                "INBOX 1: Plans for Thursday (read)",
+                "[Gmail]/All Mail 11: Plans for Thursday (read)",
+                "[Gmail]/All Mail 12: Lunch (unread)",
+                "[Gmail]/All Mail 13: Re: Plans for Thursday (read)",
+                "[Gmail]/Sent Mail 21: Re: Plans for Thursday (read)",
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -769,8 +1060,8 @@ mod tests {
         let sync = Sync {
             client: ImapClient::new(client).await.unwrap(),
             store: &store,
-            since: Date::constant(2026, 10, 1),
             observed: HashMap::new(),
+            unlinked: HashSet::new(),
         };
 
         let start = Instant::now();
@@ -779,7 +1070,11 @@ mod tests {
         drop(server);
     }
 
-    async fn run(store: &Store, mailboxes: Vec<FakeMailbox>) -> (Report, Vec<String>) {
+    async fn run(
+        store: &Store,
+        mailboxes: Vec<FakeMailbox>,
+        operation: Operation,
+    ) -> (Report, Vec<String>) {
         let account = Account {
             host: "imap.example.com".to_owned(),
             port: 993,
@@ -795,12 +1090,46 @@ mod tests {
         let mut sync = Sync {
             client,
             store,
-            since: Date::constant(2026, 10, 1),
             observed: HashMap::new(),
+            unlinked: HashSet::new(),
         };
-        let report = sync.sync().await.unwrap();
+        let report = match operation {
+            Operation::Sync => sync.sync(Date::constant(2026, 10, 1)).await.unwrap(),
+            Operation::Link => sync.link().await.unwrap(),
+        };
         drop(sync);
+        assert_indexed(store);
         (report, server.await.unwrap())
+    }
+
+    /// Checks that the entries indexed by message are exactly the stored entries
+    fn assert_indexed(store: &Store) {
+        let reader = store.reader().unwrap();
+        let mut entries = Vec::new();
+        for row in reader.table::<Entry>().unwrap().iter().unwrap() {
+            let (_, entry) = row.unwrap();
+            let Entry {
+                mailbox,
+                uid,
+                message,
+            } = entry.value();
+            entries.push((message, mailbox.as_str().to_owned(), uid));
+        }
+
+        let mut indexed = Vec::new();
+        for row in reader.table::<MessageEntry>().unwrap().iter().unwrap() {
+            let (key, _) = row.unwrap();
+            let (message, mailbox, uid) = key.value();
+            indexed.push((message, mailbox.to_owned(), uid));
+        }
+
+        entries.sort();
+        assert_eq!(entries, indexed);
+    }
+
+    enum Operation {
+        Sync,
+        Link,
     }
 
     /// Answers the commands the client sends with the contents of the given mailboxes
@@ -848,18 +1177,35 @@ mod tests {
                 }
 
                 let mailbox = found.unwrap();
+                let mut uid_next = 1;
+                for message in &mailbox.messages {
+                    uid_next = uid_next.max(message.uid + 1);
+                }
+
                 write!(
                     response,
                     "* FLAGS (\\Seen)\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n\
+                     * OK [UIDNEXT {uid_next}] Predicted next UID\r\n\
                      * OK [HIGHESTMODSEQ {}] Highest\r\n{tag} OK [READ-ONLY] done\r\n",
                     mailbox.modseq
                 )
                 .unwrap();
                 selected = Some(mailbox);
-            } else if command == "UID SEARCH SINCE 1-Oct-2026" {
+            } else if let Some(criteria) = command.strip_prefix("UID SEARCH ") {
                 response.push_str("* SEARCH");
                 for message in &selected.unwrap().messages {
-                    write!(response, " {}", message.uid).unwrap();
+                    let found = match criteria.strip_prefix("UID ") {
+                        Some(set) => parse_set(set).contains(&message.uid),
+                        None => match (criteria, message.arrival) {
+                            ("ALL", _) | ("SINCE 1-Oct-2026", Arrival::Recent) => true,
+                            ("SINCE 1-Oct-2026", Arrival::Archived) => false,
+                            _ => panic!("unexpected search: {criteria}"),
+                        },
+                    };
+
+                    if found {
+                        write!(response, " {}", message.uid).unwrap();
+                    }
                 }
                 write!(response, "\r\n{tag} OK done\r\n").unwrap();
             } else if let Some(arguments) = command.strip_prefix("UID FETCH ") {
@@ -880,6 +1226,7 @@ mod tests {
                         flags,
                         modseq,
                         source,
+                        arrival: _,
                     } = message;
                     let number = index + 1;
                     if items.contains("HEADER.FIELDS") {
@@ -956,6 +1303,7 @@ mod tests {
             }
         }
 
+        /// Adds a message that arrived since the start of the synchronized window
         fn message(
             mut self,
             uid: u32,
@@ -968,6 +1316,25 @@ mod tests {
                 flags,
                 modseq,
                 source,
+                arrival: Arrival::Recent,
+            });
+            self
+        }
+
+        /// Adds a message that arrived before the start of the synchronized window
+        fn archived(
+            mut self,
+            uid: u32,
+            flags: &'static str,
+            modseq: u64,
+            source: &'static str,
+        ) -> Self {
+            self.messages.push(FakeMessage {
+                uid,
+                flags,
+                modseq,
+                source,
+                arrival: Arrival::Archived,
             });
             self
         }
@@ -979,6 +1346,13 @@ mod tests {
         flags: &'static str,
         modseq: u64,
         source: &'static str,
+        arrival: Arrival,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Arrival {
+        Recent,
+        Archived,
     }
 
     #[test]

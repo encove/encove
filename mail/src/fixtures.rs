@@ -5,7 +5,9 @@ use store::Store;
 use tempfile::TempDir;
 
 use crate::imap::{Flags, MailboxName, SpecialUse};
-use crate::store::{Entry, Mailbox, MessageContents, MessageData, MessageKey, MessageSource};
+use crate::store::{
+    Entry, Mailbox, MessageContents, MessageData, MessageEntry, MessageKey, MessageSource,
+};
 
 /// Stores the messages as they would appear in Gmail, with a nested user label
 ///
@@ -28,6 +30,7 @@ pub fn store() -> (TempDir, Store) {
             name: MailboxName::new(name),
             uid_validity: 1,
             highest_modseq: None,
+            window_start: None,
             special_use,
             delimiter: Some("/".to_owned()),
         };
@@ -58,6 +61,7 @@ pub fn store() -> (TempDir, Store) {
     }
 
     let mut entries = writer.table::<Entry>().unwrap();
+    let mut index = writer.table::<MessageEntry>().unwrap();
     let (plans, lunch, reply) = (keys[0], keys[1], keys[2]);
     for (mailbox, uid, message) in [
         ("INBOX", 1, plans),
@@ -74,9 +78,10 @@ pub fn store() -> (TempDir, Store) {
             message,
         };
         entries.insert((mailbox, uid), &entry).unwrap();
+        index.insert((message, mailbox, uid), ()).unwrap();
     }
 
-    drop((mailboxes, metadata, contents, sources, entries));
+    drop((mailboxes, metadata, contents, sources, entries, index));
     writer.commit().unwrap();
     (directory, store)
 }

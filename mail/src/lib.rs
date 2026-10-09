@@ -8,8 +8,8 @@ pub use import::{ImportError, ImportReport, import_mbox};
 
 mod store;
 pub use store::{
-    Address, Attachment, Body, Entry, Mailbox, MessageContents, MessageData, MessageKey,
-    MessageSource, ReadState, ThreadMessage,
+    Address, Attachment, Body, Entry, Mailbox, MessageContents, MessageData, MessageEntry,
+    MessageKey, MessageSource, ReadState, ThreadMessage,
 };
 
 mod sync;

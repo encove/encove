@@ -600,6 +600,7 @@ impl Label {
             name,
             uid_validity: _,
             highest_modseq: _,
+            window_start: _,
             special_use,
             delimiter,
         } = mailbox;
